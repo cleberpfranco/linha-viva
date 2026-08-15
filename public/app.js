@@ -1,234 +1,35 @@
 const listeners = {};
-let apiSession = null;
-let lastStateSignature = '';
-let lastCardId = null;
-
-async function request(url, options = {}) {
-  const response = await fetch(url, {
-    ...options,
-    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) }
-  });
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.message || 'Não foi possível falar com o jogo.');
-  return data;
-}
-
-function publish(data) {
-  const signature = JSON.stringify(data.state);
-  if (signature !== lastStateSignature) {
-    lastStateSignature = signature;
-    listeners['room:state']?.(data.state);
-  }
-  if (data.card && data.card.id !== lastCardId) {
-    lastCardId = data.card.id;
-    listeners['turn:card']?.(data.card);
-  }
-  if (!data.card) lastCardId = null;
-}
-
-const socket = {
-  on(event, handler) { listeners[event] = handler; },
-  disconnect() { apiSession = null; lastStateSignature = ''; lastCardId = null; },
-  async emit(event, payload, callback) {
-    try {
-      let data;
-      if (event === 'room:create') data = await request('/api/rooms', { method: 'POST', body: JSON.stringify(payload) });
-      if (event === 'room:join') data = await request(`/api/rooms/${payload.code}/players`, { method: 'POST', body: JSON.stringify({ name: payload.name }) });
-      if (event === 'game:start') data = await request(`/api/rooms/${apiSession.code}/actions`, { method: 'POST', body: JSON.stringify({ action: 'start', playerId: apiSession.id }) });
-      if (event === 'turn:place') data = await request(`/api/rooms/${apiSession.code}/actions`, { method: 'POST', body: JSON.stringify({ action: 'place', index: payload.index, playerId: apiSession.id }) });
-      if (event === 'game:restart') data = await request(`/api/rooms/${apiSession.code}/actions`, { method: 'POST', body: JSON.stringify({ action: 'restart', playerId: apiSession.id }) });
-      if (!data) throw new Error('Ação inválida.');
-      apiSession = { code: data.code, id: data.playerId };
-      callback?.({ ok: true, ...data });
-      publish(data);
-    } catch (error) {
-      callback?.({ ok: false, message: error.message });
-    }
-  }
-};
-
-setInterval(async () => {
-  if (!apiSession) return;
-  try {
-    const data = await request(`/api/rooms/${apiSession.code}?playerId=${apiSession.id}`);
-    publish(data);
-  } catch (error) {
-    listeners.connect_error?.(error);
-  }
-}, 900);
+let apiSession = null, lastStateSignature = '', lastCardId = null;
+let room = null, me = null, activeCard = null, busy = false, feedbackTimer = null, clockTimer = null;
 const app = document.querySelector('#app');
-let room = null;
-let me = null;
-let activeCard = null;
-let busy = false;
-let feedbackTimer = null;
-
 const esc = value => String(value).replace(/[&<>'"]/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[char]);
 const year = value => value < 0 ? `${Math.abs(value)} a.C.` : String(value);
+const themeName = { mixed: 'Variados', brasil: 'Brasil', ciencia: 'Ciência', cultura: 'Cultura', mundo: 'Mundo' };
+const difficultyName = { easy: 'Fácil', medium: 'Médio', hard: 'Difícil' };
 
-function toast(message) {
-  const node = document.querySelector('#toast-template').content.firstElementChild.cloneNode(true);
-  node.textContent = message;
-  document.body.append(node);
-  requestAnimationFrame(() => node.classList.add('show'));
-  setTimeout(() => { node.classList.remove('show'); setTimeout(() => node.remove(), 250); }, 2800);
-}
-
-function welcome() {
-  room = null; me = null; activeCard = null;
-  app.innerHTML = `
-    <section class="home-shell">
-      <div class="orbit orbit-a"></div><div class="orbit orbit-b"></div>
-      <div class="brand"><span class="brand-mark">↝</span><span>Linha Viva</span></div>
-      <div class="hero-stamp">HISTÓRIA EM JOGO</div>
-      <h1>Qual é o seu<br><em>lugar</em> no tempo?</h1>
-      <p class="intro">Descubram juntos onde cada acontecimento se encaixa. Até 5 pessoas, um único código de sala.</p>
-      <form id="entry-form" class="entry-card">
-        <label for="name">Seu nome</label>
-        <input id="name" name="name" maxlength="18" autocomplete="nickname" placeholder="Como te chamam?" required />
-        <button class="button button-main" type="submit">Criar uma sala <span>→</span></button>
-        <button class="button button-link" type="button" id="show-join">Tenho um código</button>
-      </form>
-      <form id="join-form" class="entry-card hidden">
-        <button class="back" type="button" id="back-home">← Voltar</button>
-        <label for="join-name">Seu nome</label>
-        <input id="join-name" name="join-name" maxlength="18" autocomplete="nickname" placeholder="Como te chamam?" required />
-        <label for="room-code">Código da sala</label>
-        <input id="room-code" name="room-code" class="code-input" maxlength="6" autocapitalize="characters" autocomplete="off" placeholder="A1B2C" required />
-        <button class="button button-main" type="submit">Entrar na sala <span>→</span></button>
-      </form>
-      <p class="footnote">2–5 pessoas · 4 rodadas por jogador · 2 pontos por acerto</p>
-    </section>`;
-  document.querySelector('#entry-form').addEventListener('submit', createRoom);
-  document.querySelector('#show-join').addEventListener('click', () => { document.querySelector('#entry-form').classList.add('hidden'); document.querySelector('#join-form').classList.remove('hidden'); document.querySelector('#join-name').focus(); });
-  document.querySelector('#back-home').addEventListener('click', welcome);
-  document.querySelector('#join-form').addEventListener('submit', joinRoom);
-}
-
-function createRoom(event) {
-  event.preventDefault();
-  const name = new FormData(event.currentTarget).get('name');
-  socket.emit('room:create', { name }, response => {
-    if (!response.ok) return toast(response.message);
-    me = response.playerId;
-  });
-}
-
-function joinRoom(event) {
-  event.preventDefault();
-  const form = new FormData(event.currentTarget);
-  socket.emit('room:join', { name: form.get('join-name'), code: form.get('room-code') }, response => {
-    if (!response.ok) return toast(response.message);
-    me = response.playerId;
-  });
-}
-
-function playersHtml(players) {
-  return players.map(player => `<li class="player ${player.id === room.turnPlayerId ? 'turn-player' : ''} ${player.id === me ? 'is-me' : ''}">
-    <span class="avatar" style="--avatar:${player.color}">${esc(player.name).slice(0, 1).toUpperCase()}</span>
-    <span class="player-name">${esc(player.name)}${player.id === me ? '<small> você</small>' : ''}</span>
-    <strong>${player.score}</strong>${!player.connected ? '<i title="Desconectado">·</i>' : ''}
-  </li>`).join('');
-}
-
-function header() {
-  return `<header class="game-header"><button class="brand small" id="leave" aria-label="Sair da sala"><span class="brand-mark">↝</span><span>Linha Viva</span></button><div class="room-pill">SALA <b>${room.code}</b><button id="copy-code" aria-label="Copiar código">⧉</button></div></header>`;
-}
-
-function lobby() {
-  const amHost = room.hostId === me;
-  app.innerHTML = `<section class="game-shell lobby-shell">${header()}
-    <div class="lobby-copy"><span class="eyebrow">SUA SALA ESTÁ ABERTA</span><h1>Reúna a<br><em>tripulação.</em></h1><p>Envie este código para quem vai jogar com você.</p></div>
-    <div class="room-code-big" id="copy-big" role="button" tabindex="0" aria-label="Copiar código da sala">${room.code}<span>toque para copiar</span></div>
-    <section class="player-panel"><div class="panel-heading"><span>NO TEMPO</span><span>${room.players.length} / 5</span></div><ul class="players">${playersHtml(room.players)}</ul></section>
-    <div class="lobby-actions">${amHost ? `<button class="button button-main" id="start-game" ${room.players.length < 2 ? 'disabled' : ''}>Começar a partida <span>→</span></button><p>${room.players.length < 2 ? 'Falta mais uma pessoa para começar.' : 'Tudo pronto. Cada pessoa terá 4 tentativas.'}</p>` : '<div class="waiting"><span class="pulse"></span>Aguardando quem criou a sala começar…</div>'}</div>
-  </section>`;
-  bindCommon();
-  document.querySelector('#copy-big').addEventListener('click', copyCode);
-  document.querySelector('#start-game')?.addEventListener('click', () => socket.emit('game:start', response => { if (!response.ok) toast(response.message); }));
-}
-
-function gapButton(index, label) {
-  return `<button class="gap" data-index="${index}" aria-label="Colocar aqui: ${label}"><span>＋</span><small>${label}</small></button>`;
-}
-
-function timelineHtml() {
-  const entries = room.timeline;
-  let html = `<div class="timeline-scroll"><div class="timeline">${gapButton(0, 'antes de tudo')}`;
-  entries.forEach((card, index) => {
-    html += `<article class="time-card ${card.anchor ? 'anchor' : ''}"><div class="time-card-year">${year(card.year)}</div><div class="time-card-title">${esc(card.title)}</div></article>${gapButton(index + 1, index === entries.length - 1 ? 'depois de tudo' : 'entre estes eventos')}`;
-  });
-  return `${html}</div></div>`;
-}
-
-function playing() {
-  const currentPlayer = room.players.find(player => player.id === room.turnPlayerId);
-  const isMyTurn = room.turnPlayerId === me;
-  const turnText = isMyTurn ? 'Sua vez de decidir.' : `${currentPlayer?.name || 'Alguém'} está pensando…`;
-  const progress = Math.min(100, (room.turnNumber / room.maxTurns) * 100);
-  app.innerHTML = `<section class="game-shell play-shell">${header()}
-    <div class="progress"><span>RODADA ${Math.min(room.turnNumber + 1, room.maxTurns)} DE ${room.maxTurns}</span><div><i style="width:${progress}%"></i></div></div>
-    <section class="turn-banner ${isMyTurn ? 'my-turn' : ''}"><div class="turn-avatar" style="--avatar:${currentPlayer?.color || '#fff'}">${esc(currentPlayer?.name || '?').slice(0,1)}</div><div><span>${isMyTurn ? 'É COM VOCÊ' : 'VEZ DE ' + esc(currentPlayer?.name || '').toUpperCase()}</span><strong>${turnText}</strong></div></section>
-    <section class="card-stage ${isMyTurn ? '' : 'card-hidden'}">${isMyTurn && activeCard ? `<span class="eyebrow">ONDE ISSO ACONTECEU?</span><article class="mystery-card"><span class="card-index">ARQUIVO ${String(room.turnNumber + 1).padStart(2, '0')}</span><h2>${esc(activeCard.title)}</h2><p>Toque no intervalo correto da linha do tempo.</p></article>` : `<div class="think-card"><div class="hourglass">⌛</div><strong>${currentPlayer?.name || 'O jogador'} está com uma carta</strong><span>Aguarde a decisão.</span></div>`}</section>
-    <section class="board-section"><div class="board-label"><span>LIGAÇÕES NO TEMPO</span><small>toque no + para posicionar</small></div>${timelineHtml()}</section>
-    <section class="score-strip"><span>PLACAR</span><ul class="players compact">${playersHtml(room.players)}</ul></section>
-    <div id="move-feedback"></div>
-  </section>`;
-  bindCommon();
-  if (isMyTurn && activeCard && !room.lastMove) document.querySelectorAll('.gap').forEach(button => button.addEventListener('click', placeCard));
-  if (room.lastMove) showMoveFeedback();
-}
-
-function placeCard(event) {
-  if (busy) return;
-  busy = true;
-  document.querySelectorAll('.gap').forEach(button => button.disabled = true);
-  socket.emit('turn:place', { index: Number(event.currentTarget.dataset.index) }, response => {
-    if (!response.ok) { busy = false; toast(response.message); }
-  });
-}
-
-function showMoveFeedback() {
-  const move = room.lastMove;
-  const target = document.querySelector('#move-feedback');
-  if (!target || !move) return;
-  target.innerHTML = `<div class="move-feedback ${move.correct ? 'correct' : 'wrong'}"><span>${move.correct ? '✓' : '×'}</span><div><strong>${move.correct ? 'No lugar certo!' : 'Quase lá.'}</strong><p>${esc(move.playerName)} · ${esc(move.card.title)} <b>${year(move.card.year)}</b>${move.correct ? ' · +2 pontos' : ''}</p></div></div>`;
-  clearTimeout(feedbackTimer);
-  feedbackTimer = setTimeout(() => { if (target) target.innerHTML = ''; }, 2250);
-}
-
-function finished() {
-  const winners = room.players.filter(player => room.winnerIds.includes(player.id));
-  const winnerText = winners.map(player => player.name).join(' e ');
-  const amHost = room.hostId === me;
-  const ordered = [...room.players].sort((a,b) => b.score - a.score);
-  app.innerHTML = `<section class="game-shell finish-shell">${header()}
-    <div class="finish-star">✦</div><span class="eyebrow">A LINHA ESTÁ COMPLETA</span><h1>${esc(winnerText)}<br><em>${winners.length > 1 ? 'empataram!' : 'venceu!'}</em></h1><p class="finish-copy">Vocês deram novos lugares a ${room.timeline.length - 3} acontecimentos.</p>
-    <ol class="ranking">${ordered.map((player,index) => `<li class="rank-${index + 1}"><span class="place">${index + 1}</span><span class="avatar" style="--avatar:${player.color}">${esc(player.name).slice(0,1)}</span><strong>${esc(player.name)}${player.id === me ? '<small> você</small>' : ''}</strong><b>${player.score} <small>pts</small></b></li>`).join('')}</ol>
-    ${amHost ? '<button class="button button-main" id="restart">Jogar de novo <span>↻</span></button>' : '<div class="waiting"><span class="pulse"></span>Aguardando uma nova partida…</div>'}
-  </section>`;
-  bindCommon();
-  document.querySelector('#restart')?.addEventListener('click', () => socket.emit('game:restart', response => { if (!response.ok) toast(response.message); }));
-}
-
-function bindCommon() {
-  document.querySelector('#copy-code')?.addEventListener('click', copyCode);
-  document.querySelector('#leave')?.addEventListener('click', () => { if (confirm('Sair desta sala?')) { socket.disconnect(); location.reload(); } });
-}
-
-async function copyCode() {
-  try { await navigator.clipboard.writeText(room.code); toast('Código copiado.'); }
-  catch { toast(`Código da sala: ${room.code}`); }
-}
-
-socket.on('room:state', nextRoom => {
-  room = nextRoom;
-  busy = false;
-  if (room.status !== 'playing') activeCard = null;
-  if (room.status === 'lobby') lobby();
-  if (room.status === 'playing') playing();
-  if (room.status === 'finished') finished();
-});
-socket.on('turn:card', card => { activeCard = card; if (room?.status === 'playing') playing(); });
-socket.on('connect_error', () => toast('Não foi possível conectar ao jogo. Tente recarregar.'));
+async function request(url, options = {}) { const response = await fetch(url, { ...options, headers: { 'Content-Type': 'application/json', ...(options.headers || {}) } }); const data = await response.json(); if (!response.ok) throw new Error(data.message || 'Não foi possível falar com o jogo.'); return data; }
+function publish(data) { const signature = JSON.stringify(data.state); if (signature !== lastStateSignature) { lastStateSignature = signature; listeners['room:state']?.(data.state); } if (data.card && data.card.id !== lastCardId) { lastCardId = data.card.id; listeners['turn:card']?.(data.card); } if (!data.card) lastCardId = null; }
+const socket = { on(event, handler) { listeners[event] = handler; }, disconnect() { apiSession = null; lastStateSignature = ''; lastCardId = null; }, async emit(event, payload, callback) { try { let data; if (event === 'room:create') data = await request('/api/rooms', { method: 'POST', body: JSON.stringify(payload) }); if (event === 'room:join') data = await request(`/api/rooms/${payload.code}/players`, { method: 'POST', body: JSON.stringify({ name: payload.name }) }); if (event === 'game:start') data = await request(`/api/rooms/${apiSession.code}/actions`, { method: 'POST', body: JSON.stringify({ action: 'start', playerId: apiSession.id }) }); if (event === 'turn:place') data = await request(`/api/rooms/${apiSession.code}/actions`, { method: 'POST', body: JSON.stringify({ action: 'place', index: payload.index, playerId: apiSession.id }) }); if (event === 'game:restart') data = await request(`/api/rooms/${apiSession.code}/actions`, { method: 'POST', body: JSON.stringify({ action: 'restart', playerId: apiSession.id }) }); if (!data) throw new Error('Ação inválida.'); apiSession = { code: data.code, id: data.playerId }; callback?.({ ok: true, ...data }); publish(data); } catch (error) { callback?.({ ok: false, message: error.message }); } } };
+setInterval(async () => { if (!apiSession) return; try { publish(await request(`/api/rooms/${apiSession.code}?playerId=${apiSession.id}`)); } catch { listeners.connect_error?.(); } }, 900);
+function toast(message) { const node = document.querySelector('#toast-template').content.firstElementChild.cloneNode(true); node.textContent = message; document.body.append(node); requestAnimationFrame(() => node.classList.add('show')); setTimeout(() => { node.classList.remove('show'); setTimeout(() => node.remove(), 250); }, 2800); }
+function settingPills() { return `<div class="setting-pills"><span>🃏 5 cartas iniciais</span><span>⏱ 30 s por vez</span></div>`; }
+function welcome() { clearInterval(clockTimer); room = null; me = null; activeCard = null; app.innerHTML = `<section class="home-shell"><div class="confetti c1">✦</div><div class="confetti c2">●</div><div class="confetti c3">✦</div><div class="brand"><span class="brand-mark">⌘</span><span>Linha Viva</span></div><div class="hero-stamp">JOGO DE CARTAS NO TEMPO</div><h1>Quem encontra o<br><em>lugar certo?</em></h1><p class="intro">Monte uma linha do tempo com sua turma. Cada acerto faz a coleção crescer.</p><form id="entry-form" class="entry-card"><label for="name">Seu apelido</label><input id="name" name="name" maxlength="18" autocomplete="nickname" placeholder="Como te chamam?" required /><div class="setup-card"><div class="setup-title"><span>⚙️</span> Monte sua partida</div><label for="rounds">Quantas rodadas?</label><div class="range-row"><input id="rounds" name="rounds" type="range" min="1" max="50" value="12" /><output id="round-output">12</output></div><label for="theme">Cartas da partida</label><select id="theme" name="theme"><option value="mixed">🌍 Acontecimentos variados</option><option value="brasil">🇧🇷 Tema: Brasil</option><option value="ciencia">🔬 Tema: ciência e tecnologia</option><option value="cultura">🎭 Tema: cultura e esporte</option><option value="mundo">🗺️ Tema: mundo</option></select><label>Nível de dificuldade</label><div class="difficulty-group"><label><input type="radio" name="difficulty" value="easy" /> <span>😊 Fácil</span></label><label><input type="radio" name="difficulty" value="medium" checked /> <span>🎯 Médio</span></label><label><input type="radio" name="difficulty" value="hard" /> <span>🔥 Difícil</span></label></div></div><button class="button button-main" type="submit">Criar minha sala <span>→</span></button><button class="button button-link" type="button" id="show-join">Tenho um código</button></form>${settingPills()}<form id="join-form" class="entry-card hidden"><button class="back" type="button" id="back-home">← Voltar</button><label for="join-name">Seu apelido</label><input id="join-name" name="join-name" maxlength="18" autocomplete="nickname" placeholder="Como te chamam?" required /><label for="room-code">Código da sala</label><input id="room-code" name="room-code" class="code-input" maxlength="6" autocapitalize="characters" autocomplete="off" placeholder="A1B2C" required /><button class="button button-main" type="submit">Entrar na sala <span>→</span></button></form></section>`; document.querySelector('#rounds').addEventListener('input', event => { document.querySelector('#round-output').textContent = event.target.value; }); document.querySelector('#entry-form').addEventListener('submit', createRoom); document.querySelector('#show-join').addEventListener('click', () => { document.querySelector('#entry-form').classList.add('hidden'); document.querySelector('#join-form').classList.remove('hidden'); document.querySelector('#join-name').focus(); }); document.querySelector('#back-home').addEventListener('click', welcome); document.querySelector('#join-form').addEventListener('submit', joinRoom); }
+function createRoom(event) { event.preventDefault(); const form = new FormData(event.currentTarget); socket.emit('room:create', { name: form.get('name'), rounds: form.get('rounds'), theme: form.get('theme'), difficulty: form.get('difficulty') }, response => { if (!response.ok) return toast(response.message); me = response.playerId; }); }
+function joinRoom(event) { event.preventDefault(); const form = new FormData(event.currentTarget); socket.emit('room:join', { name: form.get('join-name'), code: form.get('room-code') }, response => { if (!response.ok) return toast(response.message); me = response.playerId; }); }
+function playersHtml(players) { return players.map(player => `<li class="player ${player.id === room.turnPlayerId ? 'turn-player' : ''} ${player.id === me ? 'is-me' : ''}"><span class="avatar" style="--avatar:${player.color}">${esc(player.name).slice(0, 1).toUpperCase()}</span><span class="player-name">${esc(player.name)}${player.id === me ? '<small> você</small>' : ''}</span><strong>⭐ ${player.score}</strong></li>`).join(''); }
+function header() { return `<header class="game-header"><button class="brand small" id="leave" aria-label="Sair da sala"><span class="brand-mark">⌘</span><span>Linha Viva</span></button><div class="room-pill">SALA <b>${room.code}</b><button id="copy-code" aria-label="Copiar código">⧉</button></div></header>`; }
+function gameSettings() { return `<div class="game-settings"><span>🎲 ${room.settings.rounds} rodadas</span><span>${room.settings.theme === 'mixed' ? '🌍' : '🎴'} ${themeName[room.settings.theme]}</span><span> ${difficultyName[room.settings.difficulty]}</span></div>`; }
+function lobby() { const amHost = room.hostId === me; app.innerHTML = `<section class="game-shell lobby-shell">${header()}<div class="lobby-copy"><span class="eyebrow">SUA MESA ESTÁ PRONTA</span><h1>Chame a<br><em>galera!</em></h1><p>Compartilhe o código. A partida começa com cinco cartas na mesa.</p></div><div class="room-code-big" id="copy-big" role="button" tabindex="0" aria-label="Copiar código da sala">${room.code}<span>toque para copiar</span></div>${gameSettings()}<section class="player-panel"><div class="panel-heading"><span>JOGADORES</span><span>${room.players.length} / 5</span></div><ul class="players">${playersHtml(room.players)}</ul></section><div class="lobby-actions">${amHost ? `<button class="button button-main" id="start-game" ${room.players.length < 2 ? 'disabled' : ''}>Distribuir as cartas <span>🃏</span></button><p>${room.players.length < 2 ? 'Falta mais uma pessoa para começar.' : `Tudo pronto: ${room.settings.rounds} rodadas de até 30 segundos.`}</p>` : '<div class="waiting"><span class="pulse"></span>Aguardando quem criou a sala começar…</div>'}</div></section>`; bindCommon(); document.querySelector('#copy-big').addEventListener('click', copyCode); document.querySelector('#start-game')?.addEventListener('click', () => socket.emit('game:start', response => { if (!response.ok) toast(response.message); })); }
+function gapButton(index, label) { return `<button class="gap" data-index="${index}" aria-label="Colocar aqui: ${label}"><span>＋</span></button>`; }
+function timelineHtml() { let html = `<div class="timeline-scroll"><div class="timeline">${gapButton(0, 'antes de tudo')}`; room.timeline.forEach((card, index) => { html += `<article class="time-card ${card.anchor ? 'anchor' : ''}"><span class="card-spark">✦</span><div class="time-card-year">${year(card.year)}</div><div class="time-card-title">${esc(card.title)}</div></article>${gapButton(index + 1, index === room.timeline.length - 1 ? 'depois de tudo' : 'entre estas cartas')}`; }); return `${html}</div></div>`; }
+function timerHtml() { return `<div class="timer ${room.turnPlayerId === me ? 'active' : ''}"><span>⏱</span><b id="timer-number">30</b><small>s</small><i id="timer-fill"></i></div>`; }
+function playing() { const currentPlayer = room.players.find(player => player.id === room.turnPlayerId); const isMyTurn = room.turnPlayerId === me; const progress = Math.min(100, (room.turnNumber / room.maxTurns) * 100); app.innerHTML = `<section class="game-shell play-shell">${header()}<div class="play-top"><div class="progress"><span>RODADA ${Math.min(room.turnNumber + 1, room.maxTurns)} / ${room.maxTurns}</span><div><i style="width:${progress}%"></i></div></div>${timerHtml()}</div><section class="turn-banner ${isMyTurn ? 'my-turn' : ''}"><div class="turn-avatar" style="--avatar:${currentPlayer?.color || '#fff'}">${esc(currentPlayer?.name || '?').slice(0,1)}</div><div><span>${isMyTurn ? 'SUA VEZ!' : 'VEZ DE ' + esc(currentPlayer?.name || '').toUpperCase()}</span><strong>${isMyTurn ? 'Escolha um espaço na mesa.' : `${currentPlayer?.name || 'Alguém'} está pensando…`}</strong></div></section><section class="card-stage ${isMyTurn ? '' : 'card-hidden'}">${isMyTurn && activeCard ? `<span class="eyebrow">EM QUAL LUGAR ELA ENTRA?</span><article class="mystery-card"><span class="card-index">CARTA DA RODADA ${String(room.turnNumber + 1).padStart(2, '0')}</span><span class="card-orbit">?</span><h2>${esc(activeCard.title)}</h2><p>${esc(activeCard.clue)}</p></article>` : `<div class="think-card"><div class="hourglass">🎴</div><strong>${currentPlayer?.name || 'O jogador'} está com uma carta</strong><span>Torça para ele achar o lugar certo.</span></div>`}</section><section class="board-section"><div class="board-label"><span>🃏 MESA DO TEMPO</span><small>${room.timeline.length} cartas em ordem</small></div>${timelineHtml()}</section><section class="score-strip"><span>⭐ PLACAR</span><ul class="players compact">${playersHtml(room.players)}</ul></section><div id="move-feedback"></div></section>`; bindCommon(); startClock(); if (isMyTurn && activeCard && !room.lastMove) document.querySelectorAll('.gap').forEach(button => button.addEventListener('click', placeCard)); if (room.lastMove) showMoveFeedback(); }
+function startClock() { clearInterval(clockTimer); const paint = () => { const remaining = Math.max(0, Math.ceil((room.turnEndsAt - Date.now()) / 1000)); const number = document.querySelector('#timer-number'); const fill = document.querySelector('#timer-fill'); if (number) number.textContent = remaining; if (fill) fill.style.transform = `scaleX(${remaining / room.settings.turnSeconds})`; if (remaining === 0) clearInterval(clockTimer); }; paint(); clockTimer = setInterval(paint, 250); }
+function placeCard(event) { if (busy) return; busy = true; document.querySelectorAll('.gap').forEach(button => { button.disabled = true; }); socket.emit('turn:place', { index: Number(event.currentTarget.dataset.index) }, response => { if (!response.ok) { busy = false; toast(response.message); } }); }
+function showMoveFeedback() { const move = room.lastMove; const target = document.querySelector('#move-feedback'); if (!target || !move) return; target.innerHTML = `<div class="move-feedback ${move.correct ? 'correct' : 'wrong'}"><span>${move.correct ? '✓' : move.timedOut ? '⌛' : '×'}</span><div><strong>${move.correct ? 'Carta encaixada!' : move.timedOut ? 'O tempo acabou!' : 'Quase lá!'}</strong><p>${esc(move.playerName)} · ${esc(move.card.title)} <b>${year(move.card.year)}</b>${move.correct ? ' · +2 estrelas' : ''}</p></div></div>`; clearTimeout(feedbackTimer); feedbackTimer = setTimeout(() => { if (target) target.innerHTML = ''; }, 2050); }
+function finished() { clearInterval(clockTimer); const winners = room.players.filter(player => room.winnerIds.includes(player.id)); const amHost = room.hostId === me; const ordered = [...room.players].sort((a, b) => b.score - a.score); app.innerHTML = `<section class="game-shell finish-shell">${header()}<div class="finish-star">🏆</div><span class="eyebrow">COLEÇÃO COMPLETA</span><h1>${esc(winners.map(player => player.name).join(' e '))}<br><em>${winners.length > 1 ? 'empataram!' : 'venceu!'}</em></h1><p class="finish-copy">Vocês colocaram ${room.timeline.length} cartas na mesa e viajaram por ${room.maxTurns} rodadas.</p><ol class="ranking">${ordered.map((player, index) => `<li class="rank-${index + 1}"><span class="place">${index + 1}</span><span class="avatar" style="--avatar:${player.color}">${esc(player.name).slice(0,1)}</span><strong>${esc(player.name)}${player.id === me ? '<small> você</small>' : ''}</strong><b>⭐ ${player.score}</b></li>`).join('')}</ol>${amHost ? '<button class="button button-main" id="restart">Jogar de novo <span>↻</span></button>' : '<div class="waiting"><span class="pulse"></span>Aguardando uma nova partida…</div>'}</section>`; bindCommon(); document.querySelector('#restart')?.addEventListener('click', () => socket.emit('game:restart', response => { if (!response.ok) toast(response.message); })); }
+function bindCommon() { document.querySelector('#copy-code')?.addEventListener('click', copyCode); document.querySelector('#leave')?.addEventListener('click', () => { if (confirm('Sair desta sala?')) { socket.disconnect(); location.reload(); } }); }
+async function copyCode() { try { await navigator.clipboard.writeText(room.code); toast('Código copiado.'); } catch { toast(`Código da sala: ${room.code}`); } }
+socket.on('room:state', nextRoom => { room = nextRoom; busy = false; if (room.status !== 'playing') activeCard = null; if (room.status === 'lobby') lobby(); if (room.status === 'playing') playing(); if (room.status === 'finished') finished(); });
+socket.on('turn:card', card => { activeCard = card; if (room?.status === 'playing') playing(); }); socket.on('connect_error', () => toast('Não foi possível conectar ao jogo. Tente recarregar.'));
 welcome();
