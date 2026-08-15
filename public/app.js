@@ -1,6 +1,6 @@
 const listeners = {};
 let apiSession = null, lastStateSignature = '', lastCardId = null;
-let room = null, me = null, activeCard = null, busy = false, feedbackTimer = null, clockTimer = null;
+let room = null, me = null, activeCard = null, busy = false, feedbackTimer = null, clockTimer = null, autoStartSolo = false, soloStarting = false;
 const app = document.querySelector('#app');
 const esc = value => String(value).replace(/[&<>'"]/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[char]);
 const year = value => value < 0 ? `${Math.abs(value)} a.C.` : String(value);
@@ -9,7 +9,7 @@ const difficultyName = { easy: 'Fácil', medium: 'Médio', hard: 'Difícil' };
 
 async function request(url, options = {}) { const response = await fetch(url, { ...options, headers: { 'Content-Type': 'application/json', ...(options.headers || {}) } }); const data = await response.json(); if (!response.ok) throw new Error(data.message || 'Não foi possível falar com o jogo.'); return data; }
 function publish(data) { const signature = JSON.stringify(data.state); if (signature !== lastStateSignature) { lastStateSignature = signature; listeners['room:state']?.(data.state); } if (data.card && data.card.id !== lastCardId) { lastCardId = data.card.id; listeners['turn:card']?.(data.card); } if (!data.card) lastCardId = null; }
-const socket = { on(event, handler) { listeners[event] = handler; }, disconnect() { apiSession = null; lastStateSignature = ''; lastCardId = null; }, async emit(event, payload, callback) { try { let data; if (event === 'room:create') data = await request('/api/rooms', { method: 'POST', body: JSON.stringify(payload) }); if (event === 'room:join') data = await request(`/api/rooms/${payload.code}/players`, { method: 'POST', body: JSON.stringify({ name: payload.name }) }); if (event === 'game:start') data = await request(`/api/rooms/${apiSession.code}/actions`, { method: 'POST', body: JSON.stringify({ action: 'start', playerId: apiSession.id }) }); if (event === 'turn:place') data = await request(`/api/rooms/${apiSession.code}/actions`, { method: 'POST', body: JSON.stringify({ action: 'place', index: payload.index, playerId: apiSession.id }) }); if (event === 'game:restart') data = await request(`/api/rooms/${apiSession.code}/actions`, { method: 'POST', body: JSON.stringify({ action: 'restart', playerId: apiSession.id }) }); if (!data) throw new Error('Ação inválida.'); apiSession = { code: data.code, id: data.playerId }; callback?.({ ok: true, ...data }); publish(data); } catch (error) { callback?.({ ok: false, message: error.message }); } } };
+const socket = { on(event, handler) { listeners[event] = handler; }, disconnect() { apiSession = null; lastStateSignature = ''; lastCardId = null; }, async emit(event, payload, callback) { try { let data; if (event === 'room:create') data = await request('/api/rooms', { method: 'POST', body: JSON.stringify(payload) }); if (event === 'room:join') data = await request(`/api/rooms/${payload.code}/players`, { method: 'POST', body: JSON.stringify({ name: payload.name }) }); if (event === 'game:start') data = await request(`/api/rooms/${apiSession.code}/actions`, { method: 'POST', body: JSON.stringify({ action: 'start', playerId: apiSession.id }) }); if (event === 'turn:place') data = await request(`/api/rooms/${apiSession.code}/actions`, { method: 'POST', body: JSON.stringify({ action: 'place', index: payload.index, playerId: apiSession.id }) }); if (event === 'turn:skip') data = await request(`/api/rooms/${apiSession.code}/actions`, { method: 'POST', body: JSON.stringify({ action: 'skip', playerId: apiSession.id }) }); if (event === 'game:restart') data = await request(`/api/rooms/${apiSession.code}/actions`, { method: 'POST', body: JSON.stringify({ action: 'restart', playerId: apiSession.id }) }); if (!data) throw new Error('Ação inválida.'); apiSession = { code: data.code, id: data.playerId }; callback?.({ ok: true, ...data }); publish(data); } catch (error) { callback?.({ ok: false, message: error.message }); } } };
 setInterval(async () => { if (!apiSession) return; try { publish(await request(`/api/rooms/${apiSession.code}?playerId=${apiSession.id}`)); } catch { listeners.connect_error?.(); } }, 900);
 function toast(message) { const node = document.querySelector('#toast-template').content.firstElementChild.cloneNode(true); node.textContent = message; document.body.append(node); requestAnimationFrame(() => node.classList.add('show')); setTimeout(() => { node.classList.remove('show'); setTimeout(() => node.remove(), 250); }, 2800); }
 function settingPills() { return `<div class="setting-pills"><span>🃏 5 cartas iniciais</span><span>⏱ 30 s por vez</span></div>`; }
@@ -32,4 +32,41 @@ function bindCommon() { document.querySelector('#copy-code')?.addEventListener('
 async function copyCode() { try { await navigator.clipboard.writeText(room.code); toast('Código copiado.'); } catch { toast(`Código da sala: ${room.code}`); } }
 socket.on('room:state', nextRoom => { room = nextRoom; busy = false; if (room.status !== 'playing') activeCard = null; if (room.status === 'lobby') lobby(); if (room.status === 'playing') playing(); if (room.status === 'finished') finished(); });
 socket.on('turn:card', card => { activeCard = card; if (room?.status === 'playing') playing(); }); socket.on('connect_error', () => toast('Não foi possível conectar ao jogo. Tente recarregar.'));
+// Incrementos de modo: entrada por código em primeiro plano e treino solo.
+const baseWelcome = welcome;
+const basePlaying = playing;
+welcome = function enhancedWelcome() {
+  baseWelcome();
+  const join = document.querySelector('#show-join');
+  join.className = 'join-hero';
+  join.innerHTML = '<span>🔑</span><strong>Já tem um código?</strong><small>Entrar na sala de amigos →</small>';
+  document.querySelector('.intro').insertAdjacentElement('afterend', join);
+  document.querySelector('.button-main').insertAdjacentHTML('afterend', '<button class="button button-solo" type="button" id="train-solo">🎯 Treinar sozinho <span>→</span></button>');
+  document.querySelector('#train-solo').addEventListener('click', startSolo);
+};
+function startSolo() {
+  const form = new FormData(document.querySelector('#entry-form'));
+  autoStartSolo = true; soloStarting = false;
+  socket.emit('room:create', { name: 'Treinador', rounds: form.get('rounds'), theme: form.get('theme'), difficulty: form.get('difficulty'), mode: 'solo' }, response => { if (!response.ok) toast(response.message); else me = response.playerId; });
+}
+playing = function enhancedPlaying() {
+  basePlaying();
+  if (room.settings.mode === 'solo' && room.turnPlayerId === me && activeCard && !room.lastMove) {
+    document.querySelector('.card-stage').insertAdjacentHTML('beforeend', '<button class="skip-card" id="skip-card">↪ Pular esta carta</button>');
+    document.querySelector('#skip-card').addEventListener('click', skipCard);
+  }
+};
+function skipCard() { if (busy) return; busy = true; activeCard = null; socket.emit('turn:skip', {}, response => { if (!response.ok) { busy = false; toast(response.message); } }); }
+socket.on('room:state', nextRoom => {
+  room = nextRoom; busy = false;
+  if (room.status !== 'playing') activeCard = null;
+  if (room.status === 'lobby' && autoStartSolo && room.settings.mode === 'solo' && room.hostId === me && !soloStarting) {
+    soloStarting = true;
+    socket.emit('game:start', {}, response => { if (!response.ok) toast(response.message); autoStartSolo = false; });
+    return;
+  }
+  if (room.status === 'lobby') lobby();
+  if (room.status === 'playing') playing();
+  if (room.status === 'finished') finished();
+});
 welcome();
