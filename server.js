@@ -1,14 +1,16 @@
 const path = require('path');
-const http = require('http');
 const express = require('express');
-const { Server } = require('socket.io');
+const { randomUUID } = require('crypto');
 
 const app = express();
-const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*' } });
 const port = process.env.PORT || 3000;
 
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public'), {
+  etag: false,
+  maxAge: 0,
+  setHeaders: res => res.setHeader('Cache-Control', 'no-store')
+}));
 app.get('/health', (_req, res) => res.status(200).json({ ok: true }));
 
 const MAX_PLAYERS = 5;
@@ -41,6 +43,15 @@ const anchors = [
 ];
 
 const rooms = new Map();
+const apiResult = (room, playerId) => ({
+  ok: true,
+  code: room.code,
+  playerId,
+  state: publicRoom(room),
+  card: room.turnPlayerId === playerId && room.currentCard
+    ? { id: room.currentCard.id, title: room.currentCard.title }
+    : null
+});
 
 function cleanName(value) {
   return String(value || '').trim().replace(/\s+/g, ' ').slice(0, 18);
@@ -67,10 +78,6 @@ function shuffle(list) {
   return copy;
 }
 
-function playerFor(room, socketId) {
-  return room.players.find(player => player.socketId === socketId);
-}
-
 function publicPlayer(player) {
   return { id: player.id, name: player.name, color: player.color, score: player.score, connected: player.connected };
 }
@@ -90,18 +97,6 @@ function publicRoom(room) {
   };
 }
 
-function emitState(room) {
-  io.to(room.code).emit('room:state', publicRoom(room));
-  if (room.status === 'playing' && room.currentCard) {
-    const player = room.players.find(item => item.id === room.turnPlayerId);
-    if (player && player.connected) io.to(player.socketId).emit('turn:card', { id: room.currentCard.id, title: room.currentCard.title });
-  }
-}
-
-function turnPlayer(room) {
-  return room.players.find(player => player.id === room.turnPlayerId);
-}
-
 function advanceTurn(room) {
   room.currentCard = null;
   room.lastMove = null;
@@ -110,7 +105,6 @@ function advanceTurn(room) {
     room.status = 'finished';
     const highScore = Math.max(...room.players.map(player => player.score));
     room.winnerIds = room.players.filter(player => player.score === highScore).map(player => player.id);
-    emitState(room);
     return;
   }
   const start = room.players.findIndex(player => player.id === room.turnPlayerId);
@@ -122,49 +116,51 @@ function advanceTurn(room) {
   if (!next) return;
   room.turnPlayerId = next.id;
   room.currentCard = room.deck.pop();
-  emitState(room);
 }
 
-function roomForSocket(socket) {
-  const code = socket.data.roomCode;
-  return code && rooms.get(code);
+function findSession(body) {
+  const room = rooms.get(cleanRoom(body.code));
+  const player = room?.players.find(item => item.id === body.playerId);
+  return { room, player };
 }
 
-io.on('connection', socket => {
-  socket.on('room:create', ({ name }, respond) => {
-    const safeName = cleanName(name);
-    if (!safeName) return respond({ ok: false, message: 'Escreva seu nome para criar a sala.' });
-    const code = makeRoomCode();
-    const player = { id: socket.id, socketId: socket.id, name: safeName, color: COLORS[0], score: 0, connected: true };
-    const room = { code, hostId: player.id, players: [player], status: 'lobby', timeline: [], deck: [], turnPlayerId: null, turnNumber: 0, maxTurns: 0, currentCard: null, lastMove: null };
-    rooms.set(code, room);
-    socket.join(code);
-    socket.data.roomCode = code;
-    respond({ ok: true, code, playerId: player.id });
-    emitState(room);
-  });
+app.post('/api/rooms', (req, res) => {
+  const name = cleanName(req.body.name);
+  if (!name) return res.status(400).json({ ok: false, message: 'Escreva seu nome para criar a sala.' });
+  const code = makeRoomCode();
+  const id = randomUUID();
+  const player = { id, name, color: COLORS[0], score: 0, connected: true };
+  const room = { code, hostId: id, players: [player], status: 'lobby', timeline: [], deck: [], turnPlayerId: null, turnNumber: 0, maxTurns: 0, currentCard: null, lastMove: null, winnerIds: [] };
+  rooms.set(code, room);
+  return res.status(201).json(apiResult(room, id));
+});
 
-  socket.on('room:join', ({ name, code }, respond) => {
-    const room = rooms.get(cleanRoom(code));
-    const safeName = cleanName(name);
-    if (!room) return respond({ ok: false, message: 'Não encontramos essa sala. Confira o código.' });
-    if (room.status !== 'lobby') return respond({ ok: false, message: 'Essa partida já começou.' });
-    if (!safeName) return respond({ ok: false, message: 'Escreva seu nome para entrar.' });
-    if (room.players.length >= MAX_PLAYERS) return respond({ ok: false, message: 'A sala já chegou a cinco pessoas.' });
-    if (room.players.some(player => player.name.toLowerCase() === safeName.toLowerCase())) return respond({ ok: false, message: 'Escolha outro nome nesta sala.' });
-    const player = { id: socket.id, socketId: socket.id, name: safeName, color: COLORS[room.players.length], score: 0, connected: true };
-    room.players.push(player);
-    socket.join(room.code);
-    socket.data.roomCode = room.code;
-    respond({ ok: true, code: room.code, playerId: player.id });
-    emitState(room);
-  });
+app.post('/api/rooms/:code/players', (req, res) => {
+  const room = rooms.get(cleanRoom(req.params.code));
+  const name = cleanName(req.body.name);
+  if (!room) return res.status(404).json({ ok: false, message: 'Não encontramos essa sala. Confira o código.' });
+  if (room.status !== 'lobby') return res.status(409).json({ ok: false, message: 'Essa partida já começou.' });
+  if (!name) return res.status(400).json({ ok: false, message: 'Escreva seu nome para entrar.' });
+  if (room.players.length >= MAX_PLAYERS) return res.status(409).json({ ok: false, message: 'A sala já chegou a cinco pessoas.' });
+  if (room.players.some(item => item.name.toLowerCase() === name.toLowerCase())) return res.status(409).json({ ok: false, message: 'Escolha outro nome nesta sala.' });
+  const id = randomUUID();
+  room.players.push({ id, name, color: COLORS[room.players.length], score: 0, connected: true });
+  return res.status(201).json(apiResult(room, id));
+});
 
-  socket.on('game:start', (respond) => {
-    const room = roomForSocket(socket);
-    const player = room && playerFor(room, socket.id);
-    if (!room || !player || room.hostId !== player.id) return respond?.({ ok: false, message: 'Só quem criou a sala pode iniciar.' });
-    if (room.players.length < 2) return respond?.({ ok: false, message: 'Chame pelo menos mais uma pessoa.' });
+app.get('/api/rooms/:code', (req, res) => {
+  const room = rooms.get(cleanRoom(req.params.code));
+  const player = room?.players.find(item => item.id === req.query.playerId);
+  if (!room || !player) return res.status(404).json({ ok: false, message: 'Sala encerrada.' });
+  return res.json(apiResult(room, player.id));
+});
+
+app.post('/api/rooms/:code/actions', (req, res) => {
+  const { room, player } = findSession({ code: req.params.code, playerId: req.body.playerId });
+  if (!room || !player) return res.status(404).json({ ok: false, message: 'Sala não encontrada.' });
+  if (req.body.action === 'start') {
+    if (room.hostId !== player.id) return res.status(403).json({ ok: false, message: 'Só quem criou a sala pode iniciar.' });
+    if (room.players.length < 2) return res.status(409).json({ ok: false, message: 'Chame pelo menos mais uma pessoa.' });
     room.status = 'playing';
     room.timeline = anchors.map(card => ({ ...card }));
     room.deck = shuffle(cards.filter(card => !room.timeline.some(anchor => anchor.year === card.year)));
@@ -173,54 +169,22 @@ io.on('connection', socket => {
     room.maxTurns = Math.min(room.deck.length, room.players.length * TURNS_PER_PLAYER);
     room.currentCard = room.deck.pop();
     room.lastMove = null;
-    emitState(room);
-    respond?.({ ok: true });
-  });
-
-  socket.on('turn:place', ({ index }, respond) => {
-    const room = roomForSocket(socket);
-    const player = room && playerFor(room, socket.id);
-    if (!room || room.status !== 'playing' || !player || room.turnPlayerId !== player.id || !room.currentCard) return respond?.({ ok: false, message: 'Agora não é a sua vez.' });
-    const safeIndex = Number(index);
-    if (!Number.isInteger(safeIndex) || safeIndex < 0 || safeIndex > room.timeline.length) return respond?.({ ok: false, message: 'Posição inválida.' });
+  } else if (req.body.action === 'place') {
+    if (room.status !== 'playing' || room.turnPlayerId !== player.id || !room.currentCard) return res.status(409).json({ ok: false, message: 'Agora não é sua vez.' });
+    const index = Number(req.body.index);
+    if (!Number.isInteger(index) || index < 0 || index > room.timeline.length) return res.status(400).json({ ok: false, message: 'Posição inválida.' });
     const correctIndex = room.timeline.filter(card => card.year < room.currentCard.year).length;
-    const correct = safeIndex === correctIndex;
-    if (correct) {
-      room.timeline.splice(safeIndex, 0, room.currentCard);
-      player.score += 2;
-    }
+    const correct = index === correctIndex;
+    if (correct) { room.timeline.splice(index, 0, room.currentCard); player.score += 2; }
     room.lastMove = { playerId: player.id, playerName: player.name, card: room.currentCard, correct, correctIndex };
-    emitState(room);
     setTimeout(() => { if (rooms.get(room.code) === room && room.status === 'playing') advanceTurn(room); }, 2300);
-    respond?.({ ok: true, correct, year: room.currentCard.year });
-  });
-
-  socket.on('game:restart', (respond) => {
-    const room = roomForSocket(socket);
-    const player = room && playerFor(room, socket.id);
-    if (!room || !player || room.hostId !== player.id) return respond?.({ ok: false, message: 'Só quem criou a sala pode reiniciar.' });
+  } else if (req.body.action === 'restart') {
+    if (room.hostId !== player.id) return res.status(403).json({ ok: false, message: 'Só quem criou a sala pode reiniciar.' });
     room.status = 'lobby';
     room.players.forEach(item => { item.score = 0; });
-    room.timeline = []; room.deck = []; room.currentCard = null; room.lastMove = null; room.turnPlayerId = null; room.turnNumber = 0; room.winnerIds = [];
-    emitState(room);
-    respond?.({ ok: true });
-  });
-
-  socket.on('disconnect', () => {
-    const room = roomForSocket(socket);
-    if (!room) return;
-    const player = playerFor(room, socket.id);
-    if (!player) return;
-    if (room.status === 'lobby') {
-      room.players = room.players.filter(item => item.id !== player.id);
-      if (!room.players.length) { rooms.delete(room.code); return; }
-      if (room.hostId === player.id) room.hostId = room.players[0].id;
-    } else {
-      player.connected = false;
-      if (room.turnPlayerId === player.id) advanceTurn(room);
-    }
-    emitState(room);
-  });
+    Object.assign(room, { timeline: [], deck: [], currentCard: null, lastMove: null, turnPlayerId: null, turnNumber: 0, maxTurns: 0, winnerIds: [] });
+  } else return res.status(400).json({ ok: false, message: 'Ação inválida.' });
+  return res.json(apiResult(room, player.id));
 });
 
-server.listen(port, () => console.log(`Linha Viva em http://localhost:${port}`));
+app.listen(port, () => console.log(`Linha Viva em http://localhost:${port}`));

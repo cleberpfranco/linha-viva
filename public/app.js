@@ -1,4 +1,61 @@
-const socket = io();
+const listeners = {};
+let apiSession = null;
+let lastStateSignature = '';
+let lastCardId = null;
+
+async function request(url, options = {}) {
+  const response = await fetch(url, {
+    ...options,
+    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) }
+  });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.message || 'Não foi possível falar com o jogo.');
+  return data;
+}
+
+function publish(data) {
+  const signature = JSON.stringify(data.state);
+  if (signature !== lastStateSignature) {
+    lastStateSignature = signature;
+    listeners['room:state']?.(data.state);
+  }
+  if (data.card && data.card.id !== lastCardId) {
+    lastCardId = data.card.id;
+    listeners['turn:card']?.(data.card);
+  }
+  if (!data.card) lastCardId = null;
+}
+
+const socket = {
+  on(event, handler) { listeners[event] = handler; },
+  disconnect() { apiSession = null; lastStateSignature = ''; lastCardId = null; },
+  async emit(event, payload, callback) {
+    try {
+      let data;
+      if (event === 'room:create') data = await request('/api/rooms', { method: 'POST', body: JSON.stringify(payload) });
+      if (event === 'room:join') data = await request(`/api/rooms/${payload.code}/players`, { method: 'POST', body: JSON.stringify({ name: payload.name }) });
+      if (event === 'game:start') data = await request(`/api/rooms/${apiSession.code}/actions`, { method: 'POST', body: JSON.stringify({ action: 'start', playerId: apiSession.id }) });
+      if (event === 'turn:place') data = await request(`/api/rooms/${apiSession.code}/actions`, { method: 'POST', body: JSON.stringify({ action: 'place', index: payload.index, playerId: apiSession.id }) });
+      if (event === 'game:restart') data = await request(`/api/rooms/${apiSession.code}/actions`, { method: 'POST', body: JSON.stringify({ action: 'restart', playerId: apiSession.id }) });
+      if (!data) throw new Error('Ação inválida.');
+      apiSession = { code: data.code, id: data.playerId };
+      callback?.({ ok: true, ...data });
+      publish(data);
+    } catch (error) {
+      callback?.({ ok: false, message: error.message });
+    }
+  }
+};
+
+setInterval(async () => {
+  if (!apiSession) return;
+  try {
+    const data = await request(`/api/rooms/${apiSession.code}?playerId=${apiSession.id}`);
+    publish(data);
+  } catch (error) {
+    listeners.connect_error?.(error);
+  }
+}, 900);
 const app = document.querySelector('#app');
 let room = null;
 let me = null;
@@ -35,9 +92,9 @@ function welcome() {
       <form id="join-form" class="entry-card hidden">
         <button class="back" type="button" id="back-home">← Voltar</button>
         <label for="join-name">Seu nome</label>
-        <input id="join-name" maxlength="18" autocomplete="nickname" placeholder="Como te chamam?" required />
+        <input id="join-name" name="join-name" maxlength="18" autocomplete="nickname" placeholder="Como te chamam?" required />
         <label for="room-code">Código da sala</label>
-        <input id="room-code" class="code-input" maxlength="6" autocapitalize="characters" autocomplete="off" placeholder="A1B2C" required />
+        <input id="room-code" name="room-code" class="code-input" maxlength="6" autocapitalize="characters" autocomplete="off" placeholder="A1B2C" required />
         <button class="button button-main" type="submit">Entrar na sala <span>→</span></button>
       </form>
       <p class="footnote">2–5 pessoas · 4 rodadas por jogador · 2 pontos por acerto</p>
